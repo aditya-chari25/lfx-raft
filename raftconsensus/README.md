@@ -175,6 +175,9 @@ curl http://localhost:8080/status
 
 ---
 
+### Node Logs 
+<img width="1043" alt="Screenshot 2025-05-26 at 10 05 21 AM" src="https://github.com/user-attachments/assets/27460dae-57e5-4eec-8edf-24b00165cae1" />
+
 ### Propose a Command
 
 ```bash
@@ -188,6 +191,7 @@ curl -X POST -H "Content-Type: application/json" -d '{"command": "set_value_X_to
   "command": "set_value_X_to_100",
   "message": "Command proposed to leader successfully"
 }
+
 ```
 
 #### Example Response (No Leader)
