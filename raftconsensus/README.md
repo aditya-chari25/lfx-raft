@@ -140,36 +140,36 @@ curl http://localhost:8080/status
 
 ```json
 {
-  "leader_id": 3,
-  "leader_term": 5,
-  "message": "Raft Cluster Status",
-  "node_states": [
-    {
-      "id": 1,
-      "state": "Follower",
-      "term": 5
-    },
-    {
-      "id": 2,
-      "state": "Follower",
-      "term": 5
-    },
-    {
-      "id": 3,
-      "state": "Leader",
-      "term": 5
-    },
-    {
-      "id": 4,
-      "state": "Follower",
-      "term": 5
-    },
-    {
-      "id": 5,
-      "state": "Follower",
-      "term": 5
-    }
-  ]
+    "leader_id": -1,
+    "leader_term": 0,
+    "message": "Raft Cluster Status",
+    "node_states": [
+        {
+            "id": 1,
+            "state": "Follower",
+            "term": 126
+        },
+        {
+            "id": 2,
+            "state": "Follower",
+            "term": 126
+        },
+        {
+            "id": 3,
+            "state": "Candidate",
+            "term": 126
+        },
+        {
+            "id": 4,
+            "state": "Follower",
+            "term": 126
+        },
+        {
+            "id": 5,
+            "state": "Follower",
+            "term": 126
+        }
+    ]
 }
 ```
 
