@@ -1,4 +1,4 @@
-# Raft Consensus Implementation
+## Raft Consensus Implementation
 
 This project contains a **Raft-based consensus** as well as a **BFT-based implementation** written in Go.
 
@@ -14,3 +14,14 @@ To access the Raft consensus implementation, navigate to the `raftconsensus` dir
 cd raftconsensus
 ```
 The BFT based consensus isn't working to the full extent (still working on it)
+## BFT Consensus Implementation
+Similarly to the above project, this project is also implemented using Go
+
+## Accessing the Implementation
+
+To access the BFT-based implementation, navigate to the bftconsensus directory:
+
+```bash
+cd bftconsensus
+```
+
