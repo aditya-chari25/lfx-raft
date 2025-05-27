@@ -11,7 +11,7 @@ The primary goal is to provide a clear, runnable example of a consensus algorith
 - **Cluster Simulation**: Representing 3-5 nodes as Go goroutines.
 - **Leader Election**: Implementing a timeout-based leader election mechanism.
 - **Consensus Mechanism**: Achieving agreement on log entries (operations).
-- **Fault Tolerance**: Handling simulated message drops.
+- **Fault Tolerance**: **Fault Tolerance**: Handling simulated message drops and network partitions.
 - **API Interface**: Exposing cluster status and command proposal via a REST API.
 
 ---
