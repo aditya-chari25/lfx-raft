@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"raftconsensus/internal/node" // Import the node package
 
@@ -59,30 +60,52 @@ func (s *Server) HttpServer() *http.Server {
 	return s.httpServer
 }
 
+// findLeader returns the current leader node and its term
+func (s *Server) findLeader() (*node.Node, int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var leader *node.Node
+	var leaderTerm int
+
+	for _, n := range s.nodes {
+		if n == nil {
+			continue
+		}
+		n.Mu().Lock()
+		if n.State() == node.Leader {
+			leader = n
+			leaderTerm = n.CurrentTerm()
+			n.Mu().Unlock()
+			break
+		}
+		n.Mu().Unlock()
+	}
+
+	return leader, leaderTerm
+}
+
 // getStatus handler provides the current status of the Raft cluster.
 func (s *Server) getStatus(c *gin.Context) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	leader, leaderTerm := s.findLeader()
 	leaderID := -1
-	var leaderTerm int
+	if leader != nil {
+		leaderID = leader.ID()
+	}
+
 	var nodeStates []map[string]interface{}
 
 	for _, n := range s.nodes {
 		if n == nil {
-			continue // Skip nil nodes if slice is 1-indexed and some indices are empty
+			continue
 		}
-		// Access node's internal state (requires Node to expose a safe way to read state)
-		// For now, we'll assume direct access for simplicity in this simulation.
-		// In a real app, Node would have methods like GetState(), GetCurrentTerm(), IsLeader()
-		n.Mu().Lock() // Lock the node's mutex to read its state safely
+		n.Mu().Lock()
 		state := n.State()
 		term := n.CurrentTerm()
 		id := n.ID()
-		if state == node.Leader {
-			leaderID = id
-			leaderTerm = term
-		}
 		nodeStates = append(nodeStates, map[string]interface{}{
 			"id":    id,
 			"state": state,
@@ -90,6 +113,9 @@ func (s *Server) getStatus(c *gin.Context) {
 		})
 		n.Mu().Unlock()
 	}
+
+	log.Printf("Cluster status - Leader ID: %d, Leader Term: %d, Total Nodes: %d\n",
+		leaderID, leaderTerm, len(nodeStates))
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":     "Raft Cluster Status",
@@ -106,42 +132,59 @@ func (s *Server) postCommand(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&request); err != nil {
+		log.Printf("Invalid command request: %v\n", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	// Try to find the leader with multiple attempts
+	var leader *node.Node
+	var leaderTerm int
 
-	// Find the current leader
-	var currentLeader *node.Node
-	for _, n := range s.nodes {
-		if n == nil {
-			continue
-		}
-		n.Mu().Lock() // Lock the node's mutex to read its state safely
-		if n.State() == node.Leader {
-			currentLeader = n
-		}
-		n.Mu().Unlock()
-		if currentLeader != nil {
+	// Try up to 3 times to find a leader with a short delay between attempts
+	for i := 0; i < 3; i++ {
+		leader, leaderTerm = s.findLeader()
+		if leader != nil {
 			break
 		}
+		if i < 2 { // Don't sleep on the last attempt
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 
-	if currentLeader == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "No leader available. Please try again shortly."})
+	if leader == nil {
+		log.Printf("No leader available. Current node states:\n")
+		for _, n := range s.nodes {
+			if n == nil {
+				continue
+			}
+			n.Mu().Lock()
+			log.Printf("Node %d: State=%s, Term=%d\n", n.ID(), n.State(), n.CurrentTerm())
+			n.Mu().Unlock()
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":   "No leader available. Please try again shortly.",
+			"details": "Cluster is currently in leader election or transition.",
+		})
 		return
 	}
 
-	// Simulate sending the command to the leader.
-	// In a real Raft, this would involve the leader appending to its log and replicating.
-	// For this simulation, we'll call a method on the leader node.
-	err := currentLeader.ProposeCommand(request.Command)
+	log.Printf("Forwarding command '%s' to leader (Node %d, Term %d)\n",
+		request.Command, leader.ID(), leaderTerm)
+
+	err := leader.ProposeCommand(request.Command)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to propose command: %v", err)})
+		log.Printf("Failed to propose command: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": fmt.Sprintf("Failed to propose command: %v", err),
+		})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Command proposed to leader successfully", "command": request.Command})
+	c.JSON(http.StatusOK, gin.H{
+		"message":   "Command proposed to leader successfully",
+		"command":   request.Command,
+		"leader_id": leader.ID(),
+		"term":      leaderTerm,
+	})
 }

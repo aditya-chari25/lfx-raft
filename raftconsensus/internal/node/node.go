@@ -43,13 +43,16 @@ type Node struct {
 	electionTimeout  time.Duration
 	heartbeatTimeout time.Duration
 
-	electionTimer *time.Timer
+	electionTimer  *time.Timer
 	heartbeatTimer *time.Timer
 
 	votesReceived int
 	majority      int
 
-	commandChan chan string
+	commandChan   chan string
+	quorumSize    int
+	lastHeartbeat time.Time
+	partitioned   bool
 }
 
 func NewNode(id int, peers []int, net *network.Network, majority int) *Node {
@@ -70,12 +73,20 @@ func NewNode(id int, peers []int, net *network.Network, majority int) *Node {
 		matchIndex:       make([]int, len(peers)+1),
 		majority:         majority,
 		commandChan:      make(chan string, 10),
+		quorumSize:       (len(peers)+1)/2 + 1,
+		lastHeartbeat:    time.Now(),
+		partitioned:      false,
 	}
-	log.Printf("[Node %d] Initialized as %s, Term %d. Election Timeout: %v\n", node.id, node.state, node.currentTerm, node.electionTimeout)
+	log.Printf("[Node %d] Initialized as %s, Term %d. Election Timeout: %v, Quorum Size: %d\n",
+		node.id, node.state, node.currentTerm, node.electionTimeout, node.quorumSize)
 	return node
 }
 
 func (n *Node) Run() {
+	// Start election timeout immediately with a random delay
+	initialDelay := time.Duration(rand.Intn(300)) * time.Millisecond
+	time.Sleep(initialDelay)
+
 	n.electionTimer = time.NewTimer(n.electionTimeout)
 	defer n.electionTimer.Stop()
 
@@ -143,6 +154,7 @@ func (n *Node) runFollower() {
 				n.state = Candidate
 			}
 			n.mu.Unlock()
+			return
 		}
 	}
 }
@@ -156,7 +168,8 @@ func (n *Node) runCandidate() {
 	n.resetElectionTimer()
 	n.mu.Unlock()
 
-	n.sendRequestVotes()
+	// Send RequestVote RPCs to all peers immediately
+	go n.sendRequestVotes()
 
 	for n.state == Candidate {
 		select {
@@ -165,46 +178,63 @@ func (n *Node) runCandidate() {
 		case <-n.electionTimer.C:
 			n.mu.Lock()
 			if n.state == Candidate {
-				log.Printf("[Node %d] [Term %d] %s: Election timed out, restarting election.\n", n.id, n.currentTerm, n.state)
+				// If election times out, start new election
+				log.Printf("[Node %d] [Term %d] %s: Election timed out, starting new election.\n", n.id, n.currentTerm, n.state)
+				n.currentTerm++
+				n.votedFor = n.id
+				n.votesReceived = 1
+				n.resetElectionTimer()
+				go n.sendRequestVotes()
 			}
 			n.mu.Unlock()
-			return
 		}
 	}
 }
 
 func (n *Node) runLeader() {
 	n.mu.Lock()
-	log.Printf("[Node %d] [Term %d] %s: Won election, becoming Leader.\n", n.id, n.currentTerm, n.state)
-	for _, peerID := range n.peers {
-		n.nextIndex[peerID] = len(n.log)
-		n.matchIndex[peerID] = 0
-	}
+	n.becomeLeader()
 	n.mu.Unlock()
 
-	n.heartbeatTimer = time.NewTimer(0)
-	defer n.heartbeatTimer.Stop()
+	heartbeatTicker := time.NewTicker(n.heartbeatTimeout)
+	defer heartbeatTicker.Stop()
+
+	// Start periodic quorum check
+	quorumCheckTicker := time.NewTicker(500 * time.Millisecond)
+	defer quorumCheckTicker.Stop()
 
 	for n.state == Leader {
 		select {
+		case <-quorumCheckTicker.C:
+			if !n.checkQuorum() {
+				log.Printf("[Node %d] [Term %d] Lost quorum, stepping down\n",
+					n.id, n.currentTerm)
+				return
+			}
+		case <-heartbeatTicker.C:
+			n.sendHeartbeats()
 		case rpcMsg := <-n.rpcChan:
 			n.handleRPC(rpcMsg)
-		case clientCommand := <-n.commandChan:
+		case cmd := <-n.commandChan:
 			n.mu.Lock()
 			if n.state == Leader {
+				if !n.checkQuorum() {
+					log.Printf("[Node %d] [Term %d] Cannot process command, lost quorum\n",
+						n.id, n.currentTerm)
+					n.mu.Unlock()
+					continue
+				}
 				newEntry := rpc.LogEntry{
 					Term:    n.currentTerm,
 					Index:   len(n.log),
-					Command: clientCommand,
+					Command: cmd,
 				}
 				n.log = append(n.log, newEntry)
-				log.Printf("[Node %d] [Term %d] %s: Appending client command: \"%s\" (Index: %d)\n", n.id, n.currentTerm, n.state, newEntry.Command, newEntry.Index)
+				log.Printf("[Node %d] [Term %d] Added new entry: %v\n",
+					n.id, n.currentTerm, newEntry)
 				n.sendAppendEntriesToAll()
 			}
 			n.mu.Unlock()
-		case <-n.heartbeatTimer.C:
-			n.sendHeartbeats()
-			n.heartbeatTimer.Reset(n.heartbeatTimeout)
 		}
 	}
 }
@@ -231,35 +261,75 @@ func (n *Node) handleRPC(rpcMsg interface{}) {
 }
 
 func (n *Node) handleRequestVote(args rpc.RequestVoteArgs) rpc.RequestVoteReply {
-	reply := rpc.RequestVoteReply{Term: n.currentTerm, VoteGranted: false}
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
-	log.Printf("[Node %d] [Term %d] %s: Received RequestVote from Node %d (Term %d, LastLogIndex %d, LastLogTerm %d)\n",
-		n.id, n.currentTerm, n.state, args.CandidateID, args.Term, args.LastLogIndex, args.LastLogTerm)
+	reply := rpc.RequestVoteReply{
+		Term:        n.currentTerm,
+		VoteGranted: false,
+	}
 
-	if args.Term < n.currentTerm {
-		log.Printf("[Node %d] [Term %d] %s: Denying vote to Node %d (stale term)\n", n.id, n.currentTerm, n.state, args.CandidateID)
+	// If we're partitioned, don't grant votes
+	if n.partitioned {
+		log.Printf("[Node %d] Rejecting vote request from Node %d due to partition\n", n.id, args.CandidateID)
 		return reply
 	}
 
-	if args.Term > n.currentTerm {
-		log.Printf("[Node %d] [Term %d] %s: Received RequestVote with higher term %d from Node %d. Stepping down to Follower.\n",
-			n.id, n.currentTerm, n.state, args.Term, args.CandidateID)
-		n.currentTerm = args.Term
-		n.state = Follower
-		n.votedFor = -1
-		n.resetElectionTimer()
+	// If the candidate's term is lower, reject
+	if args.Term < n.currentTerm {
+		return reply
 	}
 
-	if (n.votedFor == -1 || n.votedFor == args.CandidateID) && n.isLogUpToDate(args.LastLogIndex, args.LastLogTerm) {
+	// If we see a higher term, revert to follower
+	if args.Term > n.currentTerm {
+		n.becomeFollower(args.Term)
+	}
+
+	// Grant vote if we haven't voted for anyone else in this term
+	// and the candidate's log is at least as up to date as ours
+	if (n.votedFor == -1 || n.votedFor == args.CandidateID) &&
+		n.isLogUpToDate(args.LastLogIndex, args.LastLogTerm) {
 		n.votedFor = args.CandidateID
 		reply.VoteGranted = true
-		n.resetElectionTimer()
-		log.Printf("[Node %d] [Term %d] %s: Granted vote to Node %d.\n", n.id, n.currentTerm, n.state, args.CandidateID)
-	} else {
-		log.Printf("[Node %d] [Term %d] %s: Denying vote to Node %d (already voted or log not up-to-date).\n", n.id, n.currentTerm, n.state, args.CandidateID)
+		n.resetElectionTimer() // Reset election timer when granting vote
 	}
 
+	reply.Term = n.currentTerm
 	return reply
+}
+
+func (n *Node) becomeFollower(term int) {
+	if n.state != Follower {
+		log.Printf("[Node %d] Converting to follower in term %d\n", n.id, term)
+	}
+	n.state = Follower
+	n.currentTerm = term
+	n.votedFor = -1
+	n.resetElectionTimer()
+}
+
+func (n *Node) checkQuorum() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.state != Leader {
+		return false
+	}
+
+	reachableNodes := 1 // Count self
+	for _, peerID := range n.peers {
+		if !n.network.IsPartitioned(n.id, peerID) {
+			reachableNodes++
+		}
+	}
+
+	hasQuorum := reachableNodes >= n.quorumSize
+	if !hasQuorum {
+		log.Printf("[Node %d] Lost quorum (reachable nodes: %d, required: %d)\n",
+			n.id, reachableNodes, n.quorumSize)
+		n.becomeFollower(n.currentTerm)
+	}
+	return hasQuorum
 }
 
 func (n *Node) isLogUpToDate(candidateLastLogIndex int, candidateLastLogTerm int) bool {
@@ -276,88 +346,111 @@ func (n *Node) isLogUpToDate(candidateLastLogIndex int, candidateLastLogTerm int
 }
 
 func (n *Node) handleRequestVoteReply(reply rpc.RequestVoteReply) {
-	if reply.Term > n.currentTerm {
-		log.Printf("[Node %d] [Term %d] %s: Received RequestVoteReply with higher term %d. Stepping down to Follower.\n",
-			n.id, n.currentTerm, n.state, reply.Term)
-		n.currentTerm = reply.Term
-		n.state = Follower
-		n.votedFor = -1
-		n.resetElectionTimer()
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// If we've moved on from candidate state, ignore the reply
+	if n.state != Candidate {
 		return
 	}
 
-	if n.state == Candidate && reply.Term == n.currentTerm {
-		if reply.VoteGranted {
-			n.votesReceived++
-			log.Printf("[Node %d] [Term %d] %s: Received vote. Total votes: %d/%d\n", n.id, n.currentTerm, n.state, n.votesReceived, n.majority)
-			if n.votesReceived >= n.majority {
-				n.state = Leader
-				if n.electionTimer != nil {
-					n.electionTimer.Stop()
-				}
-			}
+	if reply.Term > n.currentTerm {
+		log.Printf("[Node %d] [Term %d] Received vote reply with higher term %d, becoming follower\n",
+			n.id, n.currentTerm, reply.Term)
+		n.becomeFollower(reply.Term)
+		return
+	}
+
+	// Only count votes from the current term
+	if reply.Term == n.currentTerm && reply.VoteGranted {
+		n.votesReceived++
+		log.Printf("[Node %d] [Term %d] Received vote. Total votes: %d/%d\n",
+			n.id, n.currentTerm, n.votesReceived, n.majority)
+
+		if n.votesReceived >= n.majority {
+			log.Printf("[Node %d] [Term %d] Received majority votes (%d/%d), becoming leader\n",
+				n.id, n.currentTerm, n.votesReceived, n.majority)
+			n.state = Leader
+			n.becomeLeader()
 		}
 	}
 }
 
+func (n *Node) becomeLeader() {
+	if n.state != Leader {
+		return
+	}
+
+	// Initialize leader state
+	for _, peerID := range n.peers {
+		n.nextIndex[peerID] = len(n.log)
+		n.matchIndex[peerID] = 0
+	}
+
+	// Send initial empty AppendEntries RPCs (heartbeats) to establish authority
+	go n.sendHeartbeats()
+
+	log.Printf("[Node %d] [Term %d] Successfully transitioned to Leader state\n",
+		n.id, n.currentTerm)
+}
+
 func (n *Node) handleAppendEntries(args rpc.AppendEntriesArgs) rpc.AppendEntriesReply {
-	reply := rpc.AppendEntriesReply{Term: n.currentTerm, Success: false}
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
-	log.Printf("[Node %d] [Term %d] %s: Received AppendEntries from Node %d (Term %d, PrevLogIndex %d, PrevLogTerm %d, Entries: %d)\n",
-		n.id, n.currentTerm, n.state, args.LeaderID, args.Term, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries))
+	reply := rpc.AppendEntriesReply{
+		Term:    n.currentTerm,
+		Success: false,
+	}
 
+	// If we're partitioned, reject append entries
+	if n.partitioned {
+		log.Printf("[Node %d] Rejecting append entries from Node %d due to partition\n", n.id, args.LeaderID)
+		return reply
+	}
+
+	// Update last heartbeat time
+	n.lastHeartbeat = time.Now()
+
+	// If leader's term is lower, reject
 	if args.Term < n.currentTerm {
-		log.Printf("[Node %d] [Term %d] %s: Denying AppendEntries from Node %d (stale term)\n", n.id, n.currentTerm, n.state, args.LeaderID)
 		return reply
 	}
 
-	if args.Term >= n.currentTerm {
-		if args.Term > n.currentTerm || n.state != Follower {
-			log.Printf("[Node %d] [Term %d] %s: Received AppendEntries with higher/equal term %d. Stepping down to Follower.\n",
-				n.id, n.currentTerm, n.state, args.Term)
-			n.currentTerm = args.Term
-			n.state = Follower
-			n.votedFor = -1
-		}
-		n.resetElectionTimer()
+	// If we see a higher term, revert to follower
+	if args.Term > n.currentTerm {
+		n.becomeFollower(args.Term)
 	}
 
-	if args.PrevLogIndex >= len(n.log) || n.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		log.Printf("[Node %d] [Term %d] %s: Denying AppendEntries from Node %d (log inconsistency at index %d, term %d)\n",
-			n.id, n.currentTerm, n.state, args.LeaderID, args.PrevLogIndex, args.PrevLogTerm)
+	// Reset election timer since we got a valid AppendEntries
+	n.resetElectionTimer()
+
+	// Reject if log doesn't contain an entry at prevLogIndex with prevLogTerm
+	if args.PrevLogIndex >= len(n.log) ||
+		(args.PrevLogIndex >= 0 && n.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
 		return reply
 	}
 
-	newEntriesStartIndex := 0
+	// If existing entries conflict with new entries, delete them and all that follow
+	newEntries := make([]rpc.LogEntry, 0)
 	for i, entry := range args.Entries {
-		logIndex := args.PrevLogIndex + 1 + i
-		if logIndex < len(n.log) {
-			if n.log[logIndex].Term != entry.Term {
-				n.log = n.log[:logIndex]
-				log.Printf("[Node %d] [Term %d] %s: Log conflict at index %d. Truncating log.\n", n.id, n.currentTerm, n.state, logIndex)
-				break
-			}
-		} else {
-			newEntriesStartIndex = i
+		if args.PrevLogIndex+1+i >= len(n.log) ||
+			n.log[args.PrevLogIndex+1+i].Term != entry.Term {
+			n.log = n.log[:args.PrevLogIndex+1+i]
+			newEntries = args.Entries[i:]
 			break
 		}
-		newEntriesStartIndex = i + 1
 	}
 
-	if newEntriesStartIndex < len(args.Entries) {
-		n.log = append(n.log, args.Entries[newEntriesStartIndex:]...)
-		log.Printf("[Node %d] [Term %d] %s: Appended %d new entries from leader (Index: %d to %d).\n",
-			n.id, n.currentTerm, n.state, len(args.Entries)-newEntriesStartIndex, args.PrevLogIndex+1+newEntriesStartIndex, len(n.log)-1)
+	// Append any new entries not already in the log
+	if len(newEntries) > 0 {
+		n.log = append(n.log, newEntries...)
 	}
 
+	// Update commit index if leader's is higher
 	if args.LeaderCommit > n.commitIndex {
-		newCommitIndex := args.LeaderCommit
-		if newCommitIndex > len(n.log)-1 {
-			newCommitIndex = len(n.log) - 1
-		}
-		n.commitIndex = newCommitIndex
-		log.Printf("[Node %d] [Term %d] %s: Updated commitIndex to %d.\n", n.id, n.currentTerm, n.state, n.commitIndex)
-		n.applyCommittedEntries()
+		n.commitIndex = min(args.LeaderCommit, len(n.log)-1)
+		go n.applyCommittedEntries()
 	}
 
 	reply.Success = true
