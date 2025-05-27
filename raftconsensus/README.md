@@ -175,6 +175,103 @@ curl http://localhost:8080/status
 
 ---
 
+### Network Partitions and Quorum Logic (How it improves the consensus)
+
+### Network Partition Handling
+
+The system implements sophisticated network partition simulation and handling:
+
+```go
+type Network struct {
+    partitions map[int]map[int]bool  // Tracks partitioned node pairs
+    // ... other fields
+}
+```
+
+#### Key Features:
+1. **Partition Creation and Healing**
+   - Dynamic creation of network partitions between nodes
+   - Ability to heal partitions for recovery testing
+   - Partition-aware message delivery system
+
+2. **Message Delivery**
+   - Checks partition status before message delivery
+   - Simulates realistic network conditions
+   - Implements retry mechanism with exponential backoff
+
+### Quorum Logic
+
+The system maintains strict quorum requirements for leader election and operation:
+
+#### 1. Quorum Checking
+```go
+func (n *Node) checkQuorum() bool {
+    reachableNodes := 1 // Count self
+    for _, peerID := range n.peers {
+        if !n.network.IsPartitioned(n.id, peerID) {
+            reachableNodes++
+        }
+    }
+    return reachableNodes >= n.quorumSize
+}
+```
+
+#### 2. Leader Responsibilities
+- Periodic quorum verification (every 500ms)
+- Steps down if quorum is lost
+- Prevents split-brain scenarios
+
+#### 3. Command Processing
+- Verifies quorum before processing commands
+- Ensures consistency in partitioned scenarios
+- Implements retry logic for failed operations
+
+### Fault Tolerance Mechanisms
+
+1. **Split-Brain Prevention**
+   - Active quorum monitoring
+   - Partition-aware leader election
+   - Automatic leader step-down when isolated
+
+2. **Retry Mechanism**
+   - Configurable retry attempts
+   - Exponential backoff
+   - Failure detection and logging
+
+```go
+maxRetries := 3
+retryBackoff := 50 * time.Millisecond
+
+for attempt := 0; attempt < maxRetries; attempt++ {
+    if attempt > 0 {
+        time.Sleep(retryBackoff * time.Duration(attempt))
+    }
+    // Attempt operation
+}
+```
+
+3. **Safety Guarantees**
+   - No split-brain scenarios
+   - Consistent leadership in partitions
+   - Safe command processing
+
+### Improvements Over Basic Raft
+
+1. **Enhanced Network Simulation**
+   - Partition awareness
+   - Message loss probability
+   - Network delay simulation
+
+2. **Robust Leader Election**
+   - Partition-aware voting
+   - Quorum verification
+   - Term-based leader legitimacy
+
+3. **Command Processing Safety**
+   - Quorum verification before processing
+   - Partition awareness
+   - Automatic leader step-down
+
 ### Node Logs 
 <img width="1043" alt="Screenshot 2025-05-26 at 10 05 21 AM" src="https://github.com/user-attachments/assets/27460dae-57e5-4eec-8edf-24b00165cae1" />
 
